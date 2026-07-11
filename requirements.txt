@@ -1,0 +1,8 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+imbalanced-learn
+joblib
+openpyxl
+./libs/imbalanced_greedy_logreg-0.1.0.tar.gz
