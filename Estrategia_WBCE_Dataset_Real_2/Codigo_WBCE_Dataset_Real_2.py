@@ -79,16 +79,18 @@ COEFFICIENTS_WIDE_DIR = OUTPUT_DIR / "coefficients_wide"
 GRID_MANUAL_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "grid_manual"
 EQUAL_WEIGHTS_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "equal_weights"
 SKLEARN_BALANCED_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "sklearn_balanced"
+BEST_VAL_F1_GRID_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "best_val_f1_grid"
 
 
 for folder in [
     OUTPUT_DIR, FIGURES_DIR, GLOBAL_FIGURES_DIR, DATASETS_DIR, ANALYSIS_DIR,
     COEFFICIENTS_WIDE_DIR, GRID_MANUAL_COEFFICIENTS_WIDE_DIR,
     EQUAL_WEIGHTS_COEFFICIENTS_WIDE_DIR, SKLEARN_BALANCED_COEFFICIENTS_WIDE_DIR,
+    BEST_VAL_F1_GRID_COEFFICIENTS_WIDE_DIR,
 ]:
     folder.mkdir(parents=True, exist_ok=True)
 
-RUN_SIGNATURE = "real_2_risk1_risk2_classic_split_grid30_v4_mean_std_legend_cm_fixed"
+RUN_SIGNATURE = "real_2_risk1_risk2_classic_split_grid30_v5_bestf1_final_coeffs"
 
 SCENARIOS = {
     f"{REAL_SCENARIO_PREFIX}_{target_col.lower()}": {
@@ -776,13 +778,17 @@ def grid_coeff_path(scenario_name):
 
 
 def final_coeff_path(scenario_name, model_name):
-    # No existe carpeta final_models: equal_weights y sklearn_balanced se guardan como estrategias independientes.
-    # Best F1 se evalúa directamente desde grid_manual usando el par (c0, c1) seleccionado.
+    # Cada estrategia final tiene su archivo wide independiente.
+    # La rejilla completa se conserva en grid_manual, pero Best F1 se guarda
+    # aparte con solo el modelo seleccionado por seed para que VALIDACIÓN FINAL
+    # y TEST FINAL no tengan que cargar la rejilla completa.
+    if model_name == "best_val_f1_grid":
+        return BEST_VAL_F1_GRID_COEFFICIENTS_WIDE_DIR / f"{scenario_short(scenario_name)}_best_val_f1_grid_coeffs.csv"
     if model_name == "equal_weights":
         return EQUAL_WEIGHTS_COEFFICIENTS_WIDE_DIR / f"{scenario_short(scenario_name)}_equal_weights_coeffs.csv"
     if model_name == "sklearn_balanced":
         return SKLEARN_BALANCED_COEFFICIENTS_WIDE_DIR / f"{scenario_short(scenario_name)}_sklearn_balanced_coeffs.csv"
-    raise ValueError(f"Los coeficientes de {model_name} no se guardan en carpeta final independiente. Para Best F1 se usa la rejilla manual guardada.")
+    raise ValueError(f"Modelo final no reconocido para coeficientes: {model_name}")
 
 
 def coefficient_row(scenario_name, seed, model_name, c0, c1, model, feature_cols, conv):
@@ -1190,19 +1196,123 @@ def final_coefficients_ok(path, scenario_name, model_name, feature_cols):
     return coefficients_file_ok(path, scenario_name, feature_cols, {model_name}, rows_per_seed=1)
 
 
+def best_val_f1_coefficients_ok(path, scenario_name, feature_cols, best_c0, best_c1):
+    """
+    Comprueba que existe el archivo final de Best F1 con un único modelo por seed
+    y con el par de pesos seleccionado en validación.
+    """
+    if not final_coefficients_ok(path, scenario_name, "best_val_f1_grid", feature_cols):
+        return False
+
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return False
+
+    if not np.allclose(df["c0"].astype(float).to_numpy(), float(best_c0)):
+        return False
+    if not np.allclose(df["c1"].astype(float).to_numpy(), float(best_c1)):
+        return False
+
+    return True
+
+
+def save_best_val_f1_coefficients_from_grid(scenario_name, feature_cols, best_c0, best_c1):
+    """
+    Extrae de la rejilla manual solo los coeficientes del Best F1 seleccionado.
+
+    La rejilla completa se mantiene para VALIDACIÓN REJILLA. Sin embargo, una
+    vez seleccionado el mejor par (c0, c1), VALIDACIÓN FINAL y TEST FINAL deben
+    cargar solo un modelo final por seed, igual que equal_weights y
+    sklearn_balanced.
+    """
+    grid_path = grid_coeff_path(scenario_name)
+    if not grid_path.exists():
+        raise FileNotFoundError(
+            f"No existe el archivo de coeficientes de la rejilla manual para {scenario_name}: {grid_path}"
+        )
+
+    grid_df = pd.read_csv(grid_path)
+    selected_rows = []
+
+    for seed in SEEDS:
+        seed_df = grid_df[grid_df["seed"].astype(int) == int(seed)].copy()
+        if seed_df.empty:
+            raise FileNotFoundError(
+                f"Faltan coeficientes de rejilla para {scenario_name}, seed={seed}."
+            )
+
+        mask = (
+            np.isclose(seed_df["c0"].astype(float).to_numpy(), float(best_c0))
+            & np.isclose(seed_df["c1"].astype(float).to_numpy(), float(best_c1))
+        )
+        selected_seed_df = seed_df.loc[mask].copy()
+
+        if selected_seed_df.empty:
+            raise FileNotFoundError(
+                f"Faltan coeficientes Best F1 para {scenario_name}, seed={seed}, "
+                f"c0={best_c0}, c1={best_c1}."
+            )
+
+        selected_rows.append(selected_seed_df.iloc[[0]].copy())
+
+    best_coeffs_df = pd.concat(selected_rows, ignore_index=True)
+    best_coeffs_df["model_name"] = "best_val_f1_grid"
+    best_coeffs_df = best_coeffs_df.sort_values(["scenario", "seed", "model_name"]).reset_index(drop=True)
+
+    path = final_coeff_path(scenario_name, "best_val_f1_grid")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    best_coeffs_df.to_csv(path, index=False)
+
+    return path
+
+
 def train_or_load_final_coefficients(clean_df_by_scenario, feature_cols, best_df, timer_frames):
     """
-    Genera o reutiliza los coeficientes wide independientes de equal_weights y
-    sklearn_balanced.
-
-    El modelo Manual Best F1 no se guarda en una carpeta aparte: se evalúa
-    cargando directamente los coeficientes de la rejilla manual del punto
-    seleccionado, igual que en el código sintético base.
+    Genera o reutiliza los coeficientes wide independientes de las estrategias
+    finales:
+    - best_val_f1_grid: extraído desde la rejilla manual, solo 1 fila por seed.
+    - equal_weights: entrenado como estrategia independiente.
+    - sklearn_balanced: entrenado como estrategia independiente.
     """
-    _ = best_df  # Se mantiene en la firma para conservar el flujo general.
-
     for scenario_name in SCENARIOS:
-        print(f"\nCoeficientes Best F1: {scenario_name}. Se usarán desde la rejilla manual guardada.")
+        best_row = best_df[best_df["scenario"] == scenario_name].iloc[0]
+        best_c0 = float(best_row["c0"])
+        best_c1 = float(best_row["c1"])
+
+        best_path = final_coeff_path(scenario_name, "best_val_f1_grid")
+
+        if best_val_f1_coefficients_ok(best_path, scenario_name, feature_cols, best_c0, best_c1):
+            start = time.perf_counter()
+            print(f"\nCoeficientes wide best_val_f1_grid compatibles: {scenario_name}. Se reutilizan.")
+            add_wall_clock_timer(
+                timer_frames,
+                scenario_name,
+                "load_existing_final_best_val_f1_grid_coefficients",
+                start,
+                n_models=0,
+                skipped=True,
+            )
+        else:
+            start = time.perf_counter()
+            print(f"\nCoeficientes Best F1: {scenario_name}. Se extraen desde grid_manual y se guardan como archivo final independiente.")
+            print(f"Pesos seleccionados: c0={best_c0}, c1={best_c1}")
+            print(f"Carpeta destino: {best_path.parent}")
+            path = save_best_val_f1_coefficients_from_grid(
+                scenario_name=scenario_name,
+                feature_cols=feature_cols,
+                best_c0=best_c0,
+                best_c1=best_c1,
+            )
+            print(f"Coeficientes Best F1 guardados en: {path}")
+            add_wall_clock_timer(
+                timer_frames,
+                scenario_name,
+                "extract_final_best_val_f1_grid_coefficients",
+                start,
+                n_models=len(SEEDS),
+                skipped=False,
+            )
 
         for model_name in ["equal_weights", "sklearn_balanced"]:
             path = final_coeff_path(scenario_name, model_name)
@@ -1238,7 +1348,6 @@ def train_or_load_final_coefficients(clean_df_by_scenario, feature_cols, best_df
 
             add_wall_clock_timer(timer_frames, scenario_name, f"final_{model_name}_train_scenario_parallel_total", start, n_models=len(SEEDS), skipped=False)
 
-
 def evaluate_final_one_seed(seed, scenario_name, clean_df_by_scenario, feature_cols, model_name, split_name, best_c0=None, best_c1=None):
     target_col = SCENARIOS[scenario_name]["target"]
     start = time.perf_counter()
@@ -1258,12 +1367,15 @@ def evaluate_final_one_seed(seed, scenario_name, clean_df_by_scenario, feature_c
     if model_name == "best_val_f1_grid":
         if best_c0 is None or best_c1 is None:
             raise ValueError("Para evaluar best_val_f1_grid deben pasarse best_c0 y best_c1.")
-        seed_coeffs = load_seed_coeffs(grid_coeff_path(scenario_name), seed)
+        seed_coeffs = load_seed_coeffs(final_coeff_path(scenario_name, model_name), seed)
         extracted = extract_coefficients(seed_coeffs, feature_cols, best_c0, best_c1)
         if extracted is None:
-            raise FileNotFoundError(f"Faltan coeficientes de rejilla para Best F1, {scenario_name}, seed={seed}, c0={best_c0}, c1={best_c1}")
+            raise FileNotFoundError(
+                f"Faltan coeficientes finales Best F1 para {scenario_name}, seed={seed}, "
+                f"c0={best_c0}, c1={best_c1}."
+            )
         intercept, betas, conv, coeff_row = extracted
-        c0_eval, c1_eval = float(best_c0), float(best_c1)
+        c0_eval, c1_eval = float(coeff_row["c0"]), float(coeff_row["c1"])
     else:
         seed_coeffs = load_seed_coeffs(final_coeff_path(scenario_name, model_name), seed)
         extracted = extract_coefficients(seed_coeffs, feature_cols)
@@ -1351,7 +1463,7 @@ def evaluate_final_split(clean_df_by_scenario, feature_cols, best_df, split_name
             print(f"{split_name.upper()} · COMPARACIÓN FINAL · {model_name.upper()} · ESCENARIO: {scenario_name.upper()}")
             print("=" * 90)
             if model_name == "best_val_f1_grid":
-                print(f"Best F1 usa coeficientes de la rejilla manual ya guardada: c0={best_c0}, c1={best_c1}.")
+                print(f"Best F1 usa su archivo final independiente con 1 modelo por seed: c0={best_c0}, c1={best_c1}.")
             else:
                 print(f"{model_name} usa su archivo wide independiente guardado en coefficients_wide/{model_name}/.")
             print("No se entrena: se cargan coeficientes finales guardados por seed.")
@@ -2138,7 +2250,7 @@ def save_3d_surface_plot(agg_df, scenario_name, metric, filename, best_point=Non
     ax.set_ylabel("c0", labelpad=16)
     ax.set_zlabel("")
     ax.set_title("")
-    fig.suptitle(f"{pretty_scenario_label(scenario_name)} · Superficie 3D · {metric_label(metric)}", y=0.965, fontsize=13)
+    fig.suptitle(f"{pretty_scenario_label(scenario_name)} · Superficie 3D · {metric_label(metric)}", y=0.925, fontsize=13)
     ax.view_init(elev=31, azim=-56)
 
     step = 2
@@ -2195,7 +2307,7 @@ def save_heatmap_panel(agg_df, scenario_name, metrics_panel, title, filename, be
         cbar = fig.colorbar(im, ax=ax, shrink=0.85)
         cbar.set_label(metric_label(metric), rotation=90, labelpad=12)
 
-    fig.suptitle(title, fontsize=15)
+    fig.suptitle(title, fontsize=15, y=0.95)
     add_2d_grid_note(fig)
     fig.tight_layout(rect=[0, 0.035, 1, 0.95])
     fig.savefig(get_scenario_figure_path(scenario_name, filename), dpi=180)
@@ -2493,6 +2605,8 @@ def save_timers(timer_frames):
         "grid_val_evaluation_scenario_parallel_total",
         "grid_aggregation_by_scenario",
         "grid_best_selection_by_scenario",
+        "load_existing_final_best_val_f1_grid_coefficients",
+        "extract_final_best_val_f1_grid_coefficients",
         "load_existing_final_equal_weights_coefficients",
         "load_existing_final_sklearn_balanced_coefficients",
         "final_equal_weights_train_scenario_parallel_total",
@@ -2576,7 +2690,7 @@ def print_clean_timer_summary(timers):
     print("- VAL rejilla: carga coeficientes y evalúa VAL para todos los pares (c0, c1), sin reentrenar.")
     print("- Agregación/selección: calcula mean/std entre seeds y elige Best F1 por val_f1_mean.")
     print("- TEST final: carga coeficientes guardados y evalúa TEST, sin volver a entrenar ni seleccionar.")
-    print("- No existe carpeta final_models: Best F1 sale de grid_manual; Equal y Sklearn se guardan en sus carpetas independientes.")
+    print("- Best F1, Equal y Sklearn cargan archivos finales independientes con 1 modelo por seed.")
     print(f"- Rejilla actual: {len(C_VALUES)} x {len(C_VALUES)} = {grid_size} combinaciones por seed x {n_seeds} seeds.")
     print("- Risk 3 y Risk 4 se excluyen por no tener suficientes positivos para partición clásica fiable.")
 
@@ -2786,7 +2900,7 @@ def write_experiment_metadata():
             "grid_manual": str(GRID_MANUAL_COEFFICIENTS_WIDE_DIR.resolve()),
             "equal_weights": str(EQUAL_WEIGHTS_COEFFICIENTS_WIDE_DIR.resolve()),
             "sklearn_balanced": str(SKLEARN_BALANCED_COEFFICIENTS_WIDE_DIR.resolve()),
-            "best_val_f1_grid": "uses selected row from grid_manual coefficients; no duplicated final_models folder",
+            "best_val_f1_grid": str(BEST_VAL_F1_GRID_COEFFICIENTS_WIDE_DIR.resolve()),
         },
         "output_dir": str(OUTPUT_DIR.resolve()),
     }
