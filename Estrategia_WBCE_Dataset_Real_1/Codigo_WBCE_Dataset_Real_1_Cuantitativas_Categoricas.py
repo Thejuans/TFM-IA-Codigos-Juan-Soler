@@ -210,6 +210,7 @@ DATASETS_DIR = OUTPUT_DIR / "datasets"
 ANALYSIS_DIR = OUTPUT_DIR / "analysis"
 COEFFICIENTS_WIDE_DIR = OUTPUT_DIR / "coefficients_wide"
 GRID_MANUAL_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "grid_manual"
+BEST_VAL_F1_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "best_val_f1_grid"
 EQUAL_WEIGHTS_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "equal_weights"
 SKLEARN_BALANCED_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "sklearn_balanced"
 
@@ -219,6 +220,7 @@ DATASETS_DIR.mkdir(parents=True, exist_ok=True)
 ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
 COEFFICIENTS_WIDE_DIR.mkdir(parents=True, exist_ok=True)
 GRID_MANUAL_COEFFICIENTS_WIDE_DIR.mkdir(parents=True, exist_ok=True)
+BEST_VAL_F1_COEFFICIENTS_WIDE_DIR.mkdir(parents=True, exist_ok=True)
 EQUAL_WEIGHTS_COEFFICIENTS_WIDE_DIR.mkdir(parents=True, exist_ok=True)
 SKLEARN_BALANCED_COEFFICIENTS_WIDE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1523,6 +1525,9 @@ def get_coefficients_wide_path(scenario_name, strategy_name):
     if strategy_name == "grid_manual":
         return GRID_MANUAL_COEFFICIENTS_WIDE_DIR / f"{short_name}_grid_manual_coeffs.csv"
 
+    if strategy_name == "best_val_f1_grid":
+        return BEST_VAL_F1_COEFFICIENTS_WIDE_DIR / f"{short_name}_best_val_f1_grid_coeffs.csv"
+
     if strategy_name == "equal_weights":
         return EQUAL_WEIGHTS_COEFFICIENTS_WIDE_DIR / f"{short_name}_equal_weights_coeffs.csv"
 
@@ -1604,6 +1609,99 @@ def load_seed_coefficients(scenario_name, seed, strategy_name):
         return None
 
     return coeffs_df
+
+
+def save_best_val_f1_grid_coefficients(best_df):
+    """
+    Guarda los coeficientes finales de Best F1 en un archivo independiente.
+
+    La rejilla manual completa se mantiene en grid_manual y se sigue usando en
+    la validación de búsqueda. Sin embargo, en VALIDACIÓN FINAL y TEST FINAL
+    Best F1 debe cargar solo el modelo final seleccionado por seed, igual que
+    equal_weights y sklearn_balanced.
+    """
+    for scenario_name in SCENARIOS.keys():
+        best_rows = best_df[best_df["scenario"] == scenario_name]
+
+        if best_rows.empty:
+            raise ValueError(f"No hay configuración Best F1 para scenario={scenario_name}.")
+
+        best_row = best_rows.iloc[0]
+        best_c0 = float(best_row["c0"])
+        best_c1 = float(best_row["c1"])
+
+        grid_coeff_path = get_coefficients_wide_path(scenario_name, "grid_manual")
+
+        if not grid_coeff_path.exists():
+            raise FileNotFoundError(
+                f"No existe el archivo de coeficientes de la rejilla manual para "
+                f"scenario={scenario_name}: {grid_coeff_path}"
+            )
+
+        grid_coeffs_df = pd.read_csv(grid_coeff_path)
+        selected_rows = []
+
+        for seed in SEEDS:
+            seed_df = grid_coeffs_df[grid_coeffs_df["seed"].astype(int) == int(seed)].copy()
+
+            if seed_df.empty:
+                raise FileNotFoundError(
+                    f"No hay coeficientes de rejilla para scenario={scenario_name}, seed={seed}."
+                )
+
+            mask = (
+                np.isclose(seed_df["c0"].astype(float).to_numpy(), best_c0)
+                & np.isclose(seed_df["c1"].astype(float).to_numpy(), best_c1)
+            )
+
+            selected = seed_df.loc[mask].head(1).copy()
+
+            if selected.empty:
+                raise FileNotFoundError(
+                    f"No se encontraron coeficientes Best F1 para scenario={scenario_name}, "
+                    f"seed={seed}, c0={best_c0}, c1={best_c1}."
+                )
+
+            selected["model_name"] = "best_val_f1_grid"
+            selected_rows.append(selected)
+
+        best_coeffs_df = pd.concat(selected_rows, ignore_index=True)
+        best_coeffs_df = best_coeffs_df.sort_values(
+            ["scenario", "seed", "model_name"]
+        ).reset_index(drop=True)
+
+        best_coeffs_df.to_csv(
+            get_coefficients_wide_path(scenario_name, "best_val_f1_grid"),
+            index=False,
+        )
+
+        print(
+            f"Coeficientes finales Best F1 guardados para {scenario_name}: "
+            f"{len(best_coeffs_df)} modelos finales."
+        )
+
+
+def remove_existing_final_outputs_after_bestf1_update():
+    """
+    Elimina salidas finales antiguas para recalcular VALIDACIÓN FINAL y TEST
+    usando el archivo pequeño de coeficientes Best F1.
+
+    No elimina TRAIN, la rejilla manual ni la validación completa de la rejilla.
+    """
+    final_paths = [
+        VAL_FINAL_RAW_RESULTS_PATH,
+        VAL_FINAL_RAW_PREDICTIONS_PATH,
+        VAL_FINAL_AGG_RESULTS_PATH,
+        VAL_FINAL_COMPARISON_PATH,
+        TEST_FINAL_RAW_RESULTS_PATH,
+        TEST_FINAL_RAW_PREDICTIONS_PATH,
+        TEST_FINAL_AGG_RESULTS_PATH,
+        TEST_FINAL_COMPARISON_PATH,
+    ]
+
+    for path in final_paths:
+        if path.exists():
+            path.unlink()
 
 
 def add_prediction_rows(predictions_list, scenario_name, seed, model_name, split_name, split_df, y_true, y_pred, y_prob, c0, c1):
@@ -2260,7 +2358,7 @@ def get_final_model_config_for_seed(model_name, best_c0, best_c1, y_train):
             "class_weight": {0: float(best_c0), 1: float(best_c1)},
             "c0": float(best_c0),
             "c1": float(best_c1),
-            "coefficients_strategy_name": "grid_manual",
+            "coefficients_strategy_name": "best_val_f1_grid",
             "use_saved_coefficients_if_possible": True,
             "require_weight_match": True,
         }
@@ -3609,7 +3707,7 @@ def save_3d_surface_plot(agg_df, scenario_name, metric, filename, best_point=Non
     ax.set_title("")
     fig.suptitle(
         f"{format_scenario_label_for_plot(scenario_name)} · {format_metric_label_for_plot(metric, include_split=True)} · Superficie 3D",
-        y=0.965,
+        y=0.925,
         fontsize=13,
     )
 
@@ -3733,7 +3831,7 @@ def save_heatmap_panel(agg_df, scenario_name, metrics_panel, title, filename, be
         cbar = fig.colorbar(im, ax=ax, shrink=0.85)
         cbar.set_label(format_metric_label_for_plot(metric, include_split=True), rotation=90, labelpad=10)
 
-    fig.suptitle(title, fontsize=15)
+    fig.suptitle(title, fontsize=15, y=0.95)
     add_2d_grid_note(fig)
     fig.tight_layout(rect=[0, 0.035, 1, 0.95])
     fig.savefig(get_scenario_figure_path(scenario_name, filename), dpi=180)
@@ -4721,7 +4819,7 @@ def remove_old_incompatible_outputs():
             path.unlink()
 
     for scenario_name in SCENARIOS.keys():
-        for strategy_name in ["grid_manual", "equal_weights", "sklearn_balanced"]:
+        for strategy_name in ["grid_manual", "best_val_f1_grid", "equal_weights", "sklearn_balanced"]:
             coeff_path = get_coefficients_wide_path(scenario_name, strategy_name)
             if coeff_path.exists():
                 coeff_path.unlink()
@@ -5385,7 +5483,7 @@ def main():
     print("TIMERS_PATH =", TIMERS_PATH.resolve())
 
     for scenario_name in SCENARIOS.keys():
-        for strategy_name in ["grid_manual", "equal_weights", "sklearn_balanced"]:
+        for strategy_name in ["grid_manual", "best_val_f1_grid", "equal_weights", "sklearn_balanced"]:
             p = get_coefficients_wide_path(scenario_name, strategy_name)
             print(p.resolve(), p.exists())
 
@@ -5647,6 +5745,9 @@ def main():
 
     best_df = pd.DataFrame(best_rows)
     best_df.to_csv(BEST_CONFIGS_PATH, index=False)
+
+    save_best_val_f1_grid_coefficients(best_df)
+    remove_existing_final_outputs_after_bestf1_update()
 
     if balanced_df is None:
         balanced_df = compute_balanced_points_by_scenario()
