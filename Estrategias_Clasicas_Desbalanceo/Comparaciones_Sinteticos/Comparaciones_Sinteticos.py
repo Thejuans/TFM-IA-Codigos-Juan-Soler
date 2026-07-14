@@ -36,7 +36,7 @@ from greedy_logreg import GreedyClassWeightLogisticRegressionCV
 SEEDS = list(range(1, 21))
 N_JOBS = -1
 MODEL_MAX_ITER = 500
-COMPARISON_RUN_SIGNATURE = "comparison_resampling_train_real_v3_warmup_completo"
+COMPARISON_RUN_SIGNATURE = "comparison_resampling_train_real_v4_base_bestf1_final_coeffs"
 
 # Estrategias que ya vienen de los códigos base WBCE.
 BASE_MODEL_NAMES = ["best_val_f1_grid", "equal_weights", "sklearn_balanced"]
@@ -264,6 +264,14 @@ BASE_VAL_PREDICTIONS_PATH = BASE_OUTPUT_DIR / "val_final_predictions_selected_mo
 BASE_TEST_RESULTS_PATH = BASE_OUTPUT_DIR / "test_final_results_raw_multiseed.csv"
 BASE_TEST_PREDICTIONS_PATH = BASE_OUTPUT_DIR / "test_final_predictions_raw_multiseed.csv"
 
+# Desde la corrección del flujo WBCE base, Best F1 debe tener sus coeficientes
+# finales guardados en una carpeta independiente. Este script de comparación no
+# necesita leer esos coeficientes para calcular métricas, porque carga los CSV
+# finales ya generados por el código base, pero sí comprueba que existen para
+# evitar recuperar tiempos antiguos en los que TEST Best F1 cargaba toda la
+# rejilla manual.
+BASE_BEST_VAL_F1_COEFFICIENTS_DIR = BASE_OUTPUT_DIR / "coefficients_wide" / "best_val_f1_grid"
+
 OUTPUT_DIR = PROJECT_DIR / "comparacion_estrategias_sinteticos"
 FIGURES_DIR = OUTPUT_DIR / "figures" / "comparativas_globales"
 COEFFICIENTS_DIR = OUTPUT_DIR / "coeficientes"
@@ -318,6 +326,80 @@ SCENARIOS = {
 }
 
 
+def validate_corrected_base_bestf1_outputs():
+    """
+    Comprueba que el flujo WBCE base corresponde a la versión corregida.
+
+    En la versión corregida, el código base guarda un archivo pequeño con los
+    coeficientes finales de Best F1: una fila por seed. Este script no usa esos
+    coeficientes directamente, pero su existencia confirma que los tiempos de
+    VALIDACIÓN FINAL y TEST Best F1 ya no se obtienen cargando toda la rejilla.
+    """
+    missing_messages = []
+
+    if not BASE_BEST_VAL_F1_COEFFICIENTS_DIR.exists():
+        missing_messages.append(str(BASE_BEST_VAL_F1_COEFFICIENTS_DIR))
+    else:
+        for scenario_name in SCENARIOS.keys():
+            candidate_files = sorted(
+                BASE_BEST_VAL_F1_COEFFICIENTS_DIR.glob(
+                    f"{get_short_scenario_name(scenario_name)}*best_val_f1*.csv"
+                )
+            )
+
+            if not candidate_files:
+                missing_messages.append(
+                    str(BASE_BEST_VAL_F1_COEFFICIENTS_DIR / f"{get_short_scenario_name(scenario_name)}_best_val_f1_grid_coefficients_wide.csv")
+                )
+                continue
+
+            coeff_path = candidate_files[0]
+            try:
+                coeff_df = pd.read_csv(coeff_path)
+            except Exception as exc:
+                missing_messages.append(f"{coeff_path} no se puede leer: {exc}")
+                continue
+
+            required_cols = {"scenario", "seed", "model_name", "c0", "c1", "intercept"}
+            if not required_cols.issubset(set(coeff_df.columns)):
+                missing_messages.append(f"{coeff_path} no tiene las columnas mínimas esperadas")
+                continue
+
+            if set(coeff_df["scenario"].astype(str).unique().tolist()) != {str(scenario_name)}:
+                missing_messages.append(f"{coeff_path} no corresponde solo al escenario {scenario_name}")
+                continue
+
+            if set(coeff_df["model_name"].astype(str).unique().tolist()) != {"best_val_f1_grid"}:
+                missing_messages.append(f"{coeff_path} no contiene model_name=best_val_f1_grid")
+                continue
+
+            if set(coeff_df["seed"].astype(int).unique().tolist()) != set(SEEDS):
+                missing_messages.append(f"{coeff_path} no contiene exactamente las {len(SEEDS)} seeds esperadas")
+                continue
+
+            if len(coeff_df) != len(SEEDS):
+                missing_messages.append(f"{coeff_path} debería tener una fila por seed, pero tiene {len(coeff_df)} filas")
+
+    if missing_messages:
+        stop_missing_base_flow(
+            folder_name="outputs_datasets_sinteticos",
+            required_files=[
+                "coefficients_wide/best_val_f1_grid/<escenario>_best_val_f1_grid_coefficients_wide.csv",
+                "timers_execution.txt generado con el código base WBCE corregido",
+            ],
+            searched_roots=[PROJECT_DIR] + list(PROJECT_DIR.parents),
+            extra_message=(
+                "Se han encontrado los CSV finales del flujo base, pero no los coeficientes finales independientes de Best F1.\n"
+                "Eso suele indicar que todavía se están usando outputs de la versión anterior, en la que TEST Best F1 podía cargar la rejilla completa.\n"
+                "Ejecuta primero el código WBCE sintético corregido y después vuelve a lanzar esta comparación.\n\n"
+                "Elementos no encontrados o no compatibles:\n  - " + "\n  - ".join(missing_messages[:12])
+            ),
+        )
+
+    print("Coeficientes finales Best F1 del flujo base corregido encontrados:")
+    print(BASE_BEST_VAL_F1_COEFFICIENTS_DIR.resolve())
+
+
 def validate_required_base_flow():
     """
     Comprueba que existen los datasets y CSV necesarios del flujo WBCE sintético.
@@ -356,6 +438,8 @@ def validate_required_base_flow():
                 "Primeros archivos ausentes:\n  - " + "\n  - ".join(str(p) for p in missing[:12])
             ),
         )
+
+    validate_corrected_base_bestf1_outputs()
 
     print("Carpeta base WBCE encontrada:")
     print(BASE_OUTPUT_DIR.resolve())
@@ -2422,8 +2506,12 @@ def parse_base_timer_totals():
     timers_execution.txt generado por el código WBCE correspondiente.
 
     No mide tiempos de carga en este script. Extrae el coste que ya se calculó
-    en el flujo base y lo adapta a la tabla final:
+    en el flujo base corregido y lo adapta a la tabla final:
     TRAIN real, validación rejilla, agregación/selección Best F1, TEST final y total comparable.
+
+    En la versión corregida del flujo base, TEST Best F1 ya evalúa únicamente
+    los coeficientes finales guardados en best_val_f1_grid, no el archivo
+    completo de grid_manual.
     """
     timers_path = BASE_OUTPUT_DIR / "timers_execution.txt"
     rows = []
@@ -2716,7 +2804,8 @@ def save_timer_summary(timer_frames, total_start):
     lines.append("- Todas usan las mismas 20 seeds/particiones que el código base.")
     lines.append("- La heurística greedy busca pesos solo dentro de TRAIN mediante CV interna de 5 folds; VALIDACIÓN y TEST no intervienen en el ajuste.")
     lines.append("- El remuestreo se aplica solo al TRAIN; VALIDACIÓN y TEST no se remuestrean.")
-    lines.append("- Para WBCE Best F1, Equal weights y Sklearn balanced se recuperan sus tiempos reales desde timers_execution.txt del código base.")
+    lines.append("- Para WBCE Best F1, Equal weights y Sklearn balanced se recuperan sus tiempos reales desde timers_execution.txt del código base corregido.")
+    lines.append("- En el código base corregido, TEST Best F1 evalúa los coeficientes finales guardados en best_val_f1_grid; no carga toda la rejilla manual.")
     lines.append("- En la evaluación final no se reentrena: las estrategias base cargan resultados/predicciones del flujo WBCE y las nuevas cargan sus coeficientes guardados.")
     lines.append("- Antes de medir se realiza un warm-up técnico realista: precarga datasets e inicializa pandas, NumPy/BLAS, métricas, joblib, imblearn y sklearn para que el primer bloque medido no quede inflado.")
     lines.append("- En WBCE Heurística, TRAIN real incluye preparar TRAIN, escalar, búsqueda greedy con CV interna de 5 folds, refit en TRAIN y guardar coeficientes.")
@@ -2729,8 +2818,8 @@ def save_timer_summary(timer_frames, total_start):
     lines.append("0.0) COSTE COMPUTACIONAL COMPARABLE GLOBAL · BASE + NUEVAS ESTRATEGIAS")
     lines.append("   Columnas: modelos entrenados en TRAIN + TRAIN real + validación rejilla + agregación/selección Best F1 + TEST final + total comparable.")
     lines.append("   Los modelos entrenados representan ajustes de LogisticRegression en TRAIN; en WBCE Heurística incluyen pares evaluados x 5 folds + refit final.")
-    lines.append("   Para WBCE Best F1 se incluye TRAIN de la rejilla, validación de la rejilla, selección del mejor peso, salidas guardadas y TEST final.")
-    lines.append("   Para Equal weights y Sklearn balanced se incluye TRAIN real del código base, sus salidas guardadas y TEST final; no tienen búsqueda de rejilla.")
+    lines.append("   Para WBCE Best F1 se incluye TRAIN de la rejilla, validación de la rejilla, agregación/selección del mejor peso y TEST final del modelo seleccionado.")
+    lines.append("   Para Equal weights y Sklearn balanced se incluye TRAIN real del código base y TEST final; no tienen búsqueda de rejilla.")
     lines.append("   Para WBCE Heurística, TRAIN real incluye preparar TRAIN, escalar, buscar pesos con CV interna de 5 folds, hacer refit en TRAIN y guardar coeficientes; después se evalúa en TEST.")
     lines.append("   Para Random Oversampling, SMOTE y Random Undersampling, TRAIN real incluye preparar TRAIN, escalar, remuestrear solo TRAIN, entrenar y guardar coeficientes; después se evalúa en TEST.")
 
@@ -2976,6 +3065,8 @@ def run_comparison():
         "description": "Comparación final de WBCE frente a heurística greedy de pesos y estrategias clásicas de remuestreo.",
         "comparison_run_signature": COMPARISON_RUN_SIGNATURE,
         "base_output_dir": str(BASE_OUTPUT_DIR),
+        "base_best_val_f1_coefficients_dir": str(BASE_BEST_VAL_F1_COEFFICIENTS_DIR),
+        "base_best_val_f1_note": "Se exige la versión corregida del flujo WBCE base: TEST Best F1 usa coeficientes finales independientes en best_val_f1_grid, no el CSV completo de grid_manual.",
         "output_dir": str(OUTPUT_DIR),
         "seeds": SEEDS,
         "greedy_strategy": GREEDY_MODEL_NAMES,
