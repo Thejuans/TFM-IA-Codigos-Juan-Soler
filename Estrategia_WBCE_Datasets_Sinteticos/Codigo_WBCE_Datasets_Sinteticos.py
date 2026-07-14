@@ -14,6 +14,7 @@ plt.ioff()
 from pathlib import Path
 from joblib import Parallel, delayed
 from matplotlib.lines import Line2D
+from matplotlib.ticker import FormatStrFormatter
 from itertools import product
 
 from sklearn.datasets import make_classification
@@ -177,6 +178,7 @@ COEFFICIENTS_WIDE_DIR = OUTPUT_DIR / "coefficients_wide"
 GRID_MANUAL_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "grid_manual"
 EQUAL_WEIGHTS_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "equal_weights"
 SKLEARN_BALANCED_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "sklearn_balanced"
+BEST_VAL_F1_GRID_COEFFICIENTS_WIDE_DIR = COEFFICIENTS_WIDE_DIR / "best_val_f1_grid"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
@@ -185,6 +187,7 @@ COEFFICIENTS_WIDE_DIR.mkdir(parents=True, exist_ok=True)
 GRID_MANUAL_COEFFICIENTS_WIDE_DIR.mkdir(parents=True, exist_ok=True)
 EQUAL_WEIGHTS_COEFFICIENTS_WIDE_DIR.mkdir(parents=True, exist_ok=True)
 SKLEARN_BALANCED_COEFFICIENTS_WIDE_DIR.mkdir(parents=True, exist_ok=True)
+BEST_VAL_F1_GRID_COEFFICIENTS_WIDE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
@@ -756,11 +759,15 @@ def get_coefficients_wide_path(scenario_name, strategy_name):
 
     Se separan las estrategias para que:
     - la rejilla manual quede como superficie completa de pesos,
+    - best_val_f1_grid guarde solo el modelo final seleccionado por validación,
     - equal_weights exista como estrategia independiente aunque (1,1) se quite de la rejilla,
     - sklearn_balanced guarde sus pesos y coeficientes propios por semilla.
     """
     if strategy_name == "grid_manual":
         return GRID_MANUAL_COEFFICIENTS_WIDE_DIR / f"{scenario_name}_grid_manual_coefficients_wide.csv"
+
+    if strategy_name == "best_val_f1_grid":
+        return BEST_VAL_F1_GRID_COEFFICIENTS_WIDE_DIR / f"{scenario_name}_best_val_f1_grid_coefficients_wide.csv"
 
     if strategy_name == "equal_weights":
         return EQUAL_WEIGHTS_COEFFICIENTS_WIDE_DIR / f"{scenario_name}_equal_weights_coefficients_wide.csv"
@@ -1350,6 +1357,145 @@ def train_or_load_final_strategy_coefficients(timer_frames):
 
             print(f"Coeficientes guardados para {strategy_name} en escenario {scenario_name}.")
 
+
+
+def best_val_f1_grid_coefficients_are_compatible(best_df):
+    """
+    Comprueba que existe un archivo independiente con los coeficientes finales
+    de best_val_f1_grid.
+
+    Ese archivo debe contener solo el modelo seleccionado por validación:
+    una fila por seed y escenario. Así VALIDACIÓN FINAL y TEST no necesitan
+    cargar el archivo completo de la rejilla manual.
+    """
+    required_cols = {"scenario", "seed", "model_name", "c0", "c1", "intercept", "n_iter", "max_iter"}
+    expected_seeds = set(SEEDS)
+
+    for scenario_name in SCENARIOS.keys():
+        coeff_path = get_coefficients_wide_path(scenario_name, "best_val_f1_grid")
+
+        if not coeff_path.exists():
+            return False
+
+        try:
+            df = pd.read_csv(coeff_path)
+        except Exception:
+            return False
+
+        if not required_cols.issubset(set(df.columns)):
+            return False
+
+        if set(df["scenario"].unique().tolist()) != {scenario_name}:
+            return False
+
+        if set(df["seed"].astype(int).unique().tolist()) != expected_seeds:
+            return False
+
+        if set(df["model_name"].unique().tolist()) != {"best_val_f1_grid"}:
+            return False
+
+        if len(df) != len(SEEDS):
+            return False
+
+        best_row = best_df[best_df["scenario"] == scenario_name]
+        if best_row.empty:
+            return False
+
+        best_c0 = float(best_row.iloc[0]["c0"])
+        best_c1 = float(best_row.iloc[0]["c1"])
+
+        if not np.allclose(df["c0"].astype(float).to_numpy(), best_c0):
+            return False
+        if not np.allclose(df["c1"].astype(float).to_numpy(), best_c1):
+            return False
+
+    return True
+
+
+def save_best_val_f1_grid_coefficients(best_df):
+    """
+    Guarda coeficientes finales independientes de best_val_f1_grid.
+
+    La rejilla manual completa se conserva en coefficients_wide/grid_manual,
+    porque sigue siendo necesaria para superficies, validación de rejilla y
+    trazabilidad. Esta función extrae de esa rejilla únicamente el modelo final
+    seleccionado por validación para cada seed.
+
+    De esta forma, VALIDACIÓN FINAL y TEST cargan solo 20 filas por escenario,
+    no las 18 000 filas de toda la rejilla.
+    """
+    if best_val_f1_grid_coefficients_are_compatible(best_df):
+        return False
+
+    for scenario_name in SCENARIOS.keys():
+        best_row = best_df[best_df["scenario"] == scenario_name]
+        if best_row.empty:
+            raise ValueError(f"No se ha encontrado mejor configuración para scenario={scenario_name}.")
+
+        best_c0 = float(best_row.iloc[0]["c0"])
+        best_c1 = float(best_row.iloc[0]["c1"])
+
+        grid_coeff_path = get_coefficients_wide_path(scenario_name, "grid_manual")
+        if not grid_coeff_path.exists():
+            raise FileNotFoundError(
+                f"No existe el archivo de coeficientes de la rejilla manual para {scenario_name}: {grid_coeff_path}"
+            )
+
+        grid_coeffs_df = pd.read_csv(grid_coeff_path)
+        selected_rows = []
+
+        for seed in SEEDS:
+            seed_df = grid_coeffs_df[grid_coeffs_df["seed"].astype(int) == int(seed)].copy()
+            if seed_df.empty:
+                raise FileNotFoundError(
+                    f"No hay coeficientes de rejilla para scenario={scenario_name}, seed={seed}."
+                )
+
+            mask = (
+                np.isclose(seed_df["c0"].astype(float).to_numpy(), best_c0)
+                & np.isclose(seed_df["c1"].astype(float).to_numpy(), best_c1)
+            )
+            rows = seed_df.loc[mask].copy()
+
+            if rows.empty:
+                raise FileNotFoundError(
+                    f"No se encontraron coeficientes Best F1 para scenario={scenario_name}, "
+                    f"seed={seed}, c0={best_c0}, c1={best_c1}."
+                )
+
+            row = rows.iloc[0].copy()
+            row["model_name"] = "best_val_f1_grid"
+            selected_rows.append(row)
+
+        best_coeffs_df = pd.DataFrame(selected_rows)
+        best_coeffs_df = best_coeffs_df.sort_values(["scenario", "seed"]).reset_index(drop=True)
+        best_coeffs_df.to_csv(get_coefficients_wide_path(scenario_name, "best_val_f1_grid"), index=False)
+
+    return True
+
+
+def remove_existing_final_outputs_to_remeasure_best_f1():
+    """
+    Elimina únicamente salidas finales de VALIDACIÓN/TEST para que se recalculen
+    usando el archivo pequeño de coeficientes best_val_f1_grid.
+
+    No elimina la rejilla, ni sus métricas agregadas, ni la selección Best F1.
+    """
+    paths_to_remove = [
+        VAL_FINAL_RAW_RESULTS_PATH,
+        VAL_FINAL_RAW_PREDICTIONS_PATH,
+        VAL_FINAL_AGG_RESULTS_PATH,
+        VAL_FINAL_COMPARISON_PATH,
+        TEST_FINAL_RAW_RESULTS_PATH,
+        TEST_FINAL_RAW_PREDICTIONS_PATH,
+        TEST_FINAL_AGG_RESULTS_PATH,
+        TEST_FINAL_COMPARISON_PATH,
+    ]
+
+    for path in paths_to_remove:
+        if path.exists():
+            path.unlink()
+
 # ============================================================
 # 5. EVALUACIÓN FINAL EN VALIDACIÓN Y TEST
 # ============================================================
@@ -1499,7 +1645,7 @@ def get_final_model_config_for_seed(model_name, best_c0, best_c1, y_train):
             "class_weight": {0: float(best_c0), 1: float(best_c1)},
             "c0": float(best_c0),
             "c1": float(best_c1),
-            "coefficients_strategy_name": "grid_manual",
+            "coefficients_strategy_name": "best_val_f1_grid",
             "use_saved_coefficients_if_possible": True,
             "require_weight_match": True,
         }
@@ -1750,6 +1896,25 @@ def format_weights_for_pin_text(point):
     return f"c0={point['c0']:.3g}, c1={point['c1']:.3g}"
 
 
+def format_metric_value_for_annotation(value):
+    """
+    Formatea valores de métrica en etiquetas y leyendas.
+
+    Mantiene 3 decimales en la mayoría de casos, pero muestra 6 decimales
+    cuando el valor está muy cerca de 1 o de 0. Esto evita que valores como
+    0.999884 aparezcan como 1.000 o 0.99999 en los recuadros de PR-AUC/ROC-AUC/F1.
+    """
+    if value is None or pd.isna(value):
+        return "nan"
+
+    value = float(value)
+
+    if value >= 0.995 or (0.0 <= value <= 0.005):
+        return f"{value:.6f}"
+
+    return f"{value:.3f}"
+
+
 def format_pin_text(point, metric_value):
     """
     Texto de las etiquetas 2D.
@@ -1757,9 +1922,34 @@ def format_pin_text(point, metric_value):
     label = point.get("short_label", point.get("label", "Punto"))
 
     return (
-        f"{label}: {metric_value:.3f}\n"
+        f"{label}: {format_metric_value_for_annotation(metric_value)}\n"
         f"{format_weights_for_pin_text(point)}"
     )
+
+
+def apply_precise_colorbar_format_if_needed(cbar, values):
+    """
+    Evita la notación científica/desplazada en barras de color cuando las
+    métricas están muy cerca de 1 o de 0. No modifica los colores ni la escala;
+    solo cambia cómo se escriben los números de la barra.
+    """
+    values = np.asarray(values, dtype=float)
+    finite_values = values[np.isfinite(values)]
+
+    if finite_values.size == 0:
+        return
+
+    min_value = float(np.nanmin(finite_values))
+    max_value = float(np.nanmax(finite_values))
+
+    if min_value >= 0.995 or (0.0 <= min_value and max_value <= 0.005):
+        # IMPORTANTE: en Colorbar hay que asignar el formatter al propio
+        # objeto cbar antes de update_ticks(). Si se modifica solo el eje,
+        # update_ticks() puede volver a activar la notación desplazada tipo
+        # 1e-5 + 9.999e-1 y mostrar ticks 3, 4, 5...
+        cbar.formatter = FormatStrFormatter("%.6f")
+        cbar.update_ticks()
+        cbar.ax.yaxis.get_offset_text().set_visible(False)
 
 
 def estimate_label_box_size():
@@ -2759,7 +2949,7 @@ def add_3d_pin_legend(fig, metric, pin_info):
         weights_text = f"c0={info['c0']:.3g}, c1={info['c1']:.3g}"
 
         label = (
-            f"{info['label']}: {info['metric_value']:.3f} "
+            f"{info['label']}: {format_metric_value_for_annotation(info['metric_value'])} "
             f"| {weights_text}"
         )
 
@@ -2847,7 +3037,7 @@ def save_3d_surface_plot(agg_df, scenario_name, metric, filename, best_point=Non
     ax.set_title("")
     fig.suptitle(
         f"{format_scenario_label_for_plot(scenario_name)} · {format_metric_label_for_plot(metric, include_split=True)} · Superficie 3D",
-        y=0.965,
+        y=0.925,
         fontsize=13,
     )
 
@@ -2903,6 +3093,7 @@ def save_3d_surface_plot(agg_df, scenario_name, metric, filename, best_point=Non
     cbar.ax.yaxis.set_label_position("right")
     cbar.ax.yaxis.set_ticks_position("right")
     cbar.ax.tick_params(labelright=True, labelleft=False, right=True, left=False)
+    apply_precise_colorbar_format_if_needed(cbar, Z)
 
     plt.subplots_adjust(left=0.03, right=0.85, bottom=0.12, top=0.92)
 
@@ -2970,8 +3161,9 @@ def save_heatmap_panel(agg_df, scenario_name, metrics_panel, title, filename, be
         ax.set_title(format_metric_label_for_plot(metric, include_split=False), fontsize=11)
         cbar = fig.colorbar(im, ax=ax, shrink=0.85)
         cbar.set_label(format_metric_label_for_plot(metric, include_split=True), rotation=90, labelpad=10)
+        apply_precise_colorbar_format_if_needed(cbar, pivot.values)
 
-    fig.suptitle(title, fontsize=15)
+    fig.suptitle(title, fontsize=15, y=0.95)
     add_2d_grid_note(fig)
     fig.tight_layout(rect=[0, 0.035, 1, 0.95])
     fig.savefig(get_scenario_figure_path(scenario_name, filename), dpi=180)
@@ -3856,6 +4048,7 @@ def write_experiment_metadata():
         "grid_size": len(C_VALUES) * len(C_VALUES),
         "grid_uses_train_metrics": False,
         "grid_saves_validation_predictions": True,
+        "best_val_f1_grid_coefficients_saved_independently": True,
         "convergence_logging": True,
         "convergence_columns": [
             "n_iter",
@@ -3978,7 +4171,7 @@ def remove_old_incompatible_outputs():
             path.unlink()
 
     for scenario_name in SCENARIOS.keys():
-        for strategy_name in ["grid_manual", "equal_weights", "sklearn_balanced"]:
+        for strategy_name in ["grid_manual", "best_val_f1_grid", "equal_weights", "sklearn_balanced"]:
             coeff_path = get_coefficients_wide_path(scenario_name, strategy_name)
             if coeff_path.exists():
                 coeff_path.unlink()
@@ -4623,7 +4816,7 @@ def main():
     print("TIMERS_PATH =", TIMERS_PATH.resolve())
 
     for scenario_name in SCENARIOS.keys():
-        for strategy_name in ["grid_manual", "equal_weights", "sklearn_balanced"]:
+        for strategy_name in ["grid_manual", "best_val_f1_grid", "equal_weights", "sklearn_balanced"]:
             p = get_coefficients_wide_path(scenario_name, strategy_name)
             print(p.resolve(), p.exists())
 
@@ -4886,6 +5079,11 @@ def main():
     best_df = pd.DataFrame(best_rows)
     best_df.to_csv(BEST_CONFIGS_PATH, index=False)
 
+    best_coefficients_updated = save_best_val_f1_grid_coefficients(best_df)
+    if best_coefficients_updated:
+        print("\nCoeficientes finales Best F1 guardados de forma independiente.")
+        print("Se recalculan VALIDACIÓN FINAL y TEST para medirlos sin cargar toda la rejilla manual.\n")
+        remove_existing_final_outputs_to_remeasure_best_f1()
 
     if balanced_df is None:
         balanced_df = compute_balanced_points_by_scenario()
