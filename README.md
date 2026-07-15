@@ -94,7 +94,7 @@ Los scripts de comparación leen esas salidas y generan sus propias carpetas de 
 
 ## Instalación de dependencias
 
-Los códigos se han ejecutado en Python 3.13.14. Además, la librería local utilizada para la heurística greedy requiere Python 3.13 o superior. Por tanto, se recomienda utilizar Python >= 3.13 para reproducir correctamente los experimentos.
+Los códigos se han ejecutado en Python 3.13.14. Además, la librería local utilizada para la heurística greedy requiere Python 3.13 o superior. Por tanto, se recomienda utilizar Python 3.13 o una versión superior para reproducir correctamente los experimentos.
 
 Se recomienda crear un entorno virtual de Python antes de instalar las dependencias.
 
